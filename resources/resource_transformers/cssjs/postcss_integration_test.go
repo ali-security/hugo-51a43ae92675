@@ -15,6 +15,7 @@ package cssjs_test
 
 import (
 	"fmt"
+	"os"
 	"path/filepath"
 	"runtime"
 	"strings"
@@ -166,24 +167,6 @@ func TestTransformPostCSSError(t *testing.T) {
 	c.Assert(err.Error(), qt.Contains, "a.css:4:2")
 }
 
-func TestTransformPostCSSNotInstalledError(t *testing.T) {
-	if !htesting.IsCI() {
-		t.Skip("Skip long running test when running locally")
-	}
-
-	c := qt.New(t)
-
-	s, err := hugolib.NewIntegrationTestBuilder(
-		hugolib.IntegrationTestConfig{
-			T:           c,
-			NeedsOsFS:   true,
-			TxtarString: postCSSIntegrationTestFiles,
-		}).BuildE()
-
-	s.AssertIsFileError(err)
-	c.Assert(err.Error(), qt.Contains, `binary with name "postcss" not found using npx`)
-}
-
 // #9895
 func TestTransformPostCSSImportError(t *testing.T) {
 	if !htesting.IsCI() {
@@ -262,4 +245,274 @@ Styles Content: Len: 770917
 `)
 
 	}
+}
+
+// See Issue 13987.
+func TestTransformPostCSSESMConfigInModule(t *testing.T) {
+	if !htesting.IsCI() {
+		t.Skip("Skip long running test when running locally")
+	}
+
+	c := qt.New(t)
+	// Use htesting.CreateTempDir to get canonical paths on macOS
+	// (/private/var/...); Node's --permission model rejects the symlinked
+	// /var/folders/... form when crossing the project boundary.
+	rootDir, clean, err := htesting.CreateTempDir(hugofs.Os, "hugo-integration-test")
+	c.Assert(err, qt.IsNil)
+	c.Cleanup(clean)
+
+	projectDir := filepath.Join(rootDir, "project")
+	moduleDir := filepath.Join(rootDir, "external-module")
+	c.Assert(os.MkdirAll(projectDir, 0o755), qt.IsNil)
+	c.Assert(os.MkdirAll(moduleDir, 0o755), qt.IsNil)
+
+	files := `
+-- hugo.toml --
+disableKinds = ['taxonomy', 'term', 'page']
+baseURL = "https://example.com"
+[[module.imports]]
+path = "github.com/bep/hugo-mod-nop"
+-- assets/css/styles.css --
+body { color: red }
+-- layouts/home.html --
+{{ $styles := resources.Get "css/styles.css" | css.PostCSS }}
+RelPermalink: {{ $styles.RelPermalink }}|HasBody: {{ in $styles.Content "color:" }}|
+-- content/_index.md --
+---
+title: home
+---
+-- package.json --
+{
+  "devDependencies": {
+    "postcss-cli": "11.0.0",
+    "postcss-import": "16.0.0"
+  }
+}
+-- go.mod --
+module github.com/example/project
+
+go 1.20
+
+replace github.com/bep/hugo-mod-nop => ../external-module
+-- ../external-module/go.mod --
+module github.com/bep/hugo-mod-nop
+
+go 1.20
+-- ../external-module/postcss.config.js --
+import postcssImport from "postcss-import";
+export default { plugins: [postcssImport()] };
+
+`
+
+	b := hugolib.Test(c, files,
+		hugolib.TestOptWithConfig(func(cfg *hugolib.IntegrationTestConfig) {
+			cfg.WorkingDir = projectDir
+			cfg.NeedsOsFS = true
+			cfg.NeedsNpmInstall = true
+		}),
+	)
+
+	b.AssertFileContent("public/index.html",
+		"RelPermalink: /css/styles.css|HasBody: true|",
+	)
+}
+
+// Netlify stores its node_modules cache in the same tree as the Hugo file
+// cache, so Node's resolver can walk up from a module's postcss.config.js and
+// hit a node_modules outside the permission allow-list, aborting with
+// ERR_ACCESS_DENIED instead of falling through to NODE_PATH. The restricted
+// postcss-import below (an ancestor of the external module, never installed by
+// us) forces that walk to fail; the build must still succeed by resolving the
+// real postcss-import via NODE_PATH.
+//
+// See issue 15041.
+func TestTransformPostCSSESMConfigAccessDenied(t *testing.T) {
+	if !htesting.IsCI() {
+		t.Skip("Skip long running test when running locally")
+	}
+
+	c := qt.New(t)
+	// Use htesting.CreateTempDir to get canonical paths on macOS
+	// (/private/var/...); Node's --permission model rejects the symlinked
+	// /var/folders/... form when crossing the project boundary.
+	rootDir, clean, err := htesting.CreateTempDir(hugofs.Os, "hugo-integration-test")
+	c.Assert(err, qt.IsNil)
+	c.Cleanup(clean)
+
+	projectDir := filepath.Join(rootDir, "project")
+	moduleDir := filepath.Join(rootDir, "external-module")
+	c.Assert(os.MkdirAll(projectDir, 0o755), qt.IsNil)
+	c.Assert(os.MkdirAll(moduleDir, 0o755), qt.IsNil)
+
+	files := `
+-- hugo.toml --
+disableKinds = ['taxonomy', 'term', 'page']
+baseURL = "https://example.com"
+[[module.imports]]
+path = "github.com/bep/hugo-mod-nop"
+-- assets/css/styles.css --
+body { color: red }
+-- layouts/home.html --
+{{ $styles := resources.Get "css/styles.css" | css.PostCSS }}
+RelPermalink: {{ $styles.RelPermalink }}|HasBody: {{ in $styles.Content "color:" }}|
+-- content/_index.md --
+---
+title: home
+---
+-- package.json --
+{
+  "devDependencies": {
+    "postcss-cli": "11.0.0",
+    "postcss-import": "16.0.0"
+  }
+}
+-- go.mod --
+module github.com/example/project
+
+go 1.20
+
+replace github.com/bep/hugo-mod-nop => ../external-module
+-- ../node_modules/postcss-import/package.json --
+{ "name": "postcss-import", "version": "0.0.0-RESTRICTED", "main": "index.js" }
+-- ../external-module/go.mod --
+module github.com/bep/hugo-mod-nop
+
+go 1.20
+-- ../external-module/postcss.config.js --
+import postcssImport from "postcss-import";
+export default { plugins: [postcssImport()] };
+
+`
+
+	b := hugolib.Test(c, files,
+		hugolib.TestOptWithConfig(func(cfg *hugolib.IntegrationTestConfig) {
+			cfg.WorkingDir = projectDir
+			cfg.NeedsOsFS = true
+			cfg.NeedsNpmInstall = true
+		}),
+	)
+
+	b.AssertFileContent("public/index.html",
+		"RelPermalink: /css/styles.css|HasBody: true|",
+	)
+}
+
+// Node's permission model follows symlinks outside the allowed paths, so Hugo
+// rejects them before invoking Node.
+func TestTransformPostCSSSymlinkOutsideAllowRead(t *testing.T) {
+	if !htesting.IsCI() {
+		t.Skip("Skip long running test when running locally")
+	}
+	if runtime.GOOS == "windows" {
+		t.Skip("symlinks")
+	}
+
+	c := qt.New(t)
+	tempDir, clean, err := htesting.CreateTempDir(hugofs.Os, "hugo-integration-test")
+	c.Assert(err, qt.IsNil)
+	c.Cleanup(clean)
+
+	site := filepath.Join(tempDir, "site")
+	outside := filepath.Join(tempDir, "outside")
+	c.Assert(os.MkdirAll(filepath.Join(site, "assets", "css"), 0o755), qt.IsNil)
+	c.Assert(os.MkdirAll(outside, 0o755), qt.IsNil)
+	c.Assert(os.WriteFile(filepath.Join(outside, "secret.txt"), []byte("secret"), 0o644), qt.IsNil)
+	c.Assert(os.Symlink(filepath.Join(outside, "secret.txt"), filepath.Join(site, "assets", "css", "slink.css")), qt.IsNil)
+
+	files := `
+-- hugo.toml --
+disableKinds = ['taxonomy', 'term', 'page', 'section', 'rss', 'sitemap']
+[security.node.permissions]
+allowRead = ['.']
+-- assets/css/styles.css --
+body { color: red; }
+-- layouts/home.html --
+{{ $styles := resources.Get "css/styles.css" | css.PostCSS }}
+Styles: {{ $styles.Content | safeCSS }}|
+-- package.json --
+{
+	"devDependencies": {
+		"postcss": "8.5.6",
+		"postcss-cli": "11.0.0"
+	}
+}
+-- postcss.config.js --
+module.exports = { plugins: [] }
+`
+
+	withWorkingDir := hugolib.TestOptWithConfig(func(cfg *hugolib.IntegrationTestConfig) {
+		cfg.WorkingDir = site
+	})
+	withNpmInstall := hugolib.TestOptWithConfig(func(cfg *hugolib.IntegrationTestConfig) {
+		cfg.NeedsNpmInstall = true
+	})
+
+	b, err := hugolib.TestE(c, files, hugolib.TestOptOsFs(), withNpmInstall, withWorkingDir)
+	b.Assert(err, qt.ErrorMatches, `.*symlink ".*slink.css" resolves to ".*secret.txt" outside .*allowRead.*`)
+
+	files = strings.ReplaceAll(files, "allowRead = ['.']", fmt.Sprintf("allowRead = ['.', %q]", outside))
+	b = hugolib.Test(c, files, hugolib.TestOptOsFs(), withNpmInstall, withWorkingDir)
+	b.AssertFileContent("public/index.html", "Styles: body { color: red; }|")
+}
+
+// A postcss.config.js from an untrusted site must not be able to read files
+// outside of the project. See CVE-2026-44301.
+func TestTransformPostCSSConfigReadOutsideProject(t *testing.T) {
+	if !htesting.IsCI() {
+		t.Skip("Skip long running test when running locally")
+	}
+
+	c := qt.New(t)
+	tempDir, clean, err := htesting.CreateTempDir(hugofs.Os, "hugo-integration-test")
+	c.Assert(err, qt.IsNil)
+	c.Cleanup(clean)
+	// Use the canonical path, as Node's permission model only does lexical path checks.
+	tempDir, err = filepath.EvalSymlinks(tempDir)
+	c.Assert(err, qt.IsNil)
+
+	site := filepath.Join(tempDir, "site")
+	outside := filepath.Join(tempDir, "outside")
+	secret := filepath.Join(outside, "secret.txt")
+	c.Assert(os.MkdirAll(site, 0o755), qt.IsNil)
+	c.Assert(os.MkdirAll(outside, 0o755), qt.IsNil)
+	c.Assert(os.WriteFile(secret, []byte("TOPSECRET"), 0o644), qt.IsNil)
+
+	files := fmt.Sprintf(`
+-- hugo.toml --
+disableKinds = ['taxonomy', 'term', 'page', 'section', 'rss', 'sitemap']
+-- assets/css/styles.css --
+body { color: red; }
+-- layouts/home.html --
+{{ $styles := resources.Get "css/styles.css" | css.PostCSS }}
+Styles: {{ $styles.Content | safeCSS }}|
+-- package.json --
+{
+	"devDependencies": {
+		"postcss": "8.5.6",
+		"postcss-cli": "11.0.0"
+	}
+}
+-- postcss.config.js --
+const secret = require('fs').readFileSync(%q, 'utf8');
+module.exports = {
+	plugins: [{ postcssPlugin: 'leak', Once(root) { root.append({ text: 'leaked: ' + secret }); } }],
+};
+`, secret)
+
+	opts := []hugolib.TestOpt{
+		hugolib.TestOptOsFs(),
+		hugolib.TestOptWithConfig(func(cfg *hugolib.IntegrationTestConfig) {
+			cfg.WorkingDir = site
+			cfg.NeedsNpmInstall = true
+		}),
+	}
+
+	b, err := hugolib.TestE(c, files, opts...)
+	b.Assert(err, qt.ErrorMatches, `(?s).*(ERR_ACCESS_DENIED|Access to this API has been restricted).*`)
+	b.Assert(err.Error(), qt.Not(qt.Contains), "TOPSECRET")
+
+	// Verify that the config above does read the file when the Node.js permission model is disabled.
+	files = strings.Replace(files, "'sitemap']\n", "'sitemap']\n[security.node.permissions]\ndisable = true\n", 1)
+	b = hugolib.Test(c, files, opts...)
+	b.AssertFileContent("public/index.html", "leaked: TOPSECRET")
 }

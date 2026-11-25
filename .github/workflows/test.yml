@@ -98,6 +98,10 @@ jobs:
           cache-dependency-path: |
             **/go.sum
             **/go.mod
+      - name: Install Node
+        uses: actions/setup-node@53b83947a5a98c8d113130e565377fae1a50d02f # v6.3.0
+        with:
+          node-version: "22"
       - name: Install Ruby
         uses: ruby/setup-ruby@v1
         with:
@@ -126,6 +130,15 @@ jobs:
       - if: matrix.os == 'windows-latest'
         run: |
           choco install pandoc
+          if (-not (Get-Command pandoc -ErrorAction SilentlyContinue)) {
+            # The Chocolatey community feed is intermittently unavailable; fall back to the GitHub release.
+            $v = "3.6.4"
+            Invoke-WebRequest -Uri "https://github.com/jgm/pandoc/releases/download/$v/pandoc-$v-windows-x86_64.zip" -OutFile "$env:RUNNER_TEMP\pandoc.zip"
+            Expand-Archive -Path "$env:RUNNER_TEMP\pandoc.zip" -DestinationPath "$env:RUNNER_TEMP\pandoc"
+            $exe = Get-ChildItem -Path "$env:RUNNER_TEMP\pandoc" -Recurse -Filter pandoc.exe | Select-Object -First 1
+            echo $exe.DirectoryName | Out-File -FilePath $env:GITHUB_PATH -Encoding utf-8 -Append
+          }
+          exit 0
       - run: pandoc -v
       - if: matrix.os == 'windows-latest'
         run: |
